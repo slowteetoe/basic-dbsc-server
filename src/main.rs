@@ -209,10 +209,13 @@ async fn dbsc_refresh_session(
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    println!("refresh_session::Received body: {}", body);
+    println!(
+        "refresh_session::Received but terminating session (body={})",
+        body
+    );
     dbg!(&headers);
     // sec-secure-session-id
-    StatusCode::OK
+    (StatusCode::OK, "{\"continue\": false}")
 }
 
 #[allow(dead_code)]
