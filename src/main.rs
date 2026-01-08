@@ -2,17 +2,17 @@ use axum::{
     BoxError, Router,
     extract::State,
     handler::HandlerWithoutStateExt,
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, uri::Authority},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Redirect},
     routing::{get, post},
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::{DateTime, TimeDelta, Utc};
-use rustls::ContentType;
+use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::Jwk};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     net::SocketAddr,
     path::PathBuf,
@@ -31,15 +31,19 @@ struct Ports {
     https: u16,
 }
 
-pub struct AppConfig {
-    pub origin_trial: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: Uuid,
+    pub refresh_token: String,
     pub expiry: DateTime<Utc>,
-    pub jwk: Option<Claims>,
+    pub jwk: Option<Jwk>,
+    // probably need to keep track of this, should be part of the refresh I would think..?
+    pub challenge: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Claims {
+    jti: String,
 }
 
 #[derive(Debug, Clone)]
@@ -65,12 +69,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let origin_trial = env::var("ORIGIN_TRIAL").expect("missing ORIGIN_TRIAL env var");
-    let app_config = Arc::new(AppConfig { origin_trial });
 
     let mut default_headers = HeaderMap::new();
     default_headers.insert(
         "Origin-Trial",
-        HeaderValue::from_str(app_config.origin_trial.as_str())?,
+        HeaderValue::from_str(origin_trial.as_str())?,
     );
 
     let ports = Ports {
@@ -126,11 +129,6 @@ async fn protected_path(State(ds): State<SharedDatastore>, jar: CookieJar) -> im
     ()
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Claims {
-    jwk: HashMap<String, String>,
-}
-
 async fn dbsc_start_session(
     State(ds): State<SharedDatastore>,
     headers: HeaderMap,
@@ -143,52 +141,66 @@ async fn dbsc_start_session(
     if let Some(jwt) = headers.get("secure-session-response") {
         // TODO verify the JWT and extract claims
         let jwt = jwt.to_str().unwrap();
+        let header = decode_header(jwt).unwrap();
+        dbg!(&header);
 
-        let mut jwk = HashMap::new();
-        jwk.insert("crv".to_owned(), "P-256".to_owned());
-        jwk.insert("kty".to_owned(), "EC".to_owned());
-        jwk.insert(
-            "x".to_owned(),
-            "hHJEy1kbDMn9Lh9BqaDkhPoxhKC63lwrY6pfGBHeWdQ".to_owned(),
-        );
-        jwk.insert(
-            "y".to_owned(),
-            "2yIhpLLAQUIVXEW8twdck7mKKKsZCwC9sHaEen3Xkj0".to_owned(),
-        );
-        let claims = Claims { jwk };
-        dbg!(&jwt, &claims);
+        let mut validation = Validation::new(header.alg);
+        // exp is not in the DBSC claims
+        validation.required_spec_claims = HashSet::new();
+        validation.validate_exp = false;
+
+        let jwk = header.jwk.unwrap();
+
+        let claims = match decode::<Claims>(jwt, &DecodingKey::from_jwk(&jwk).unwrap(), &validation)
+        {
+            Ok(data) => data.claims,
+            Err(e) => panic!("{}", e),
+        };
+        dbg!(&claims);
+
+        let mut refresh_token = None;
 
         {
             let mut ds = ds.write().await;
             if let Some(session) = ds.data.get_mut(ticket) {
+                if claims.jti != session.challenge {
+                    println!(
+                        "challenge failed: claims={} vs session={}",
+                        claims.jti, session.challenge
+                    );
+                    return (StatusCode::FORBIDDEN, "challenge failed".to_owned());
+                }
                 println!("session found");
-                session.jwk = Some(claims)
+                session.jwk = Some(jwk);
+                refresh_token = Some(session.refresh_token.clone());
             }
         }
 
-        // what is session_id?
-        // return expected response
+        // TODO make this a struct so we don't do this nasty escaping
         (
             StatusCode::OK,
-            r#"{
-      "session_identifier": "session_id",
+            format!(
+                r#"{{
+      "session_identifier": "{}",
       "refresh_url": "/RefreshSession",
 
-      "scope": {
+      "scope": {{
         "origin": "https://slowteetoe.info",
         "include_site": true,
         "scope_specification" : []
-      },
+      }},
 
-      "credentials": [{
+      "credentials": [{{
         "type": "cookie",
         "name": "ticket",
         "attributes": "Domain=slowteetoe.info; Path=/; Secure; HttpOnly; SameSite=None"
-      }]
-      }"#,
+      }}]
+      }}"#,
+                refresh_token.unwrap()
+            ),
         )
     } else {
-        (StatusCode::BAD_REQUEST, "Invalid DBSC request")
+        (StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned())
     }
 }
 
@@ -199,6 +211,7 @@ async fn dbsc_refresh_session(
 ) -> impl IntoResponse {
     println!("refresh_session::Received body: {}", body);
     dbg!(&headers);
+    // sec-secure-session-id
     StatusCode::OK
 }
 
@@ -212,10 +225,15 @@ async fn login(State(ds): State<SharedDatastore>, jar: CookieJar) -> impl IntoRe
     let id = Uuid::new_v4();
     let session = Session {
         id,
+        refresh_token: String::from("RT1234-5678"),
         expiry: Utc::now() + TimeDelta::seconds(60),
         jwk: None,
+        challenge: Uuid::new_v4().to_string(),
     };
-    ds.write().await.data.insert(id.to_string(), session);
+    ds.write()
+        .await
+        .data
+        .insert(id.to_string(), session.clone());
     let cookie = Cookie::new("ticket", id.to_string());
 
     // direct browser to initiate DBSC if supported
@@ -223,7 +241,10 @@ async fn login(State(ds): State<SharedDatastore>, jar: CookieJar) -> impl IntoRe
         StatusCode::OK,
         [(
             "Secure-Session-Registration",
-            r#"(ES256);path="/StartSession";challenge="Y2hhbGxlbmdlCg==""#,
+            format!(
+                r#"(ES256);path="/StartSession";challenge="{}""#,
+                session.challenge
+            ),
         )],
         jar.add(cookie),
         format!("you logged in! ticket={}", id.to_string()),
@@ -259,4 +280,35 @@ async fn redirect_http_to_https(ports: Ports) {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, redirect.into_make_service()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
+
+    use crate::Claims;
+
+    #[test]
+    fn it_should_decode_jwt() {
+        let jwt = "eyJhbGciOiJFUzI1NiIsImp3ayI6eyJjcnYiOiJQLTI1NiIsImt0eSI6IkVDIiwieCI6ImhISkV5MWtiRE1uOUxoOUJxYURraFBveGhLQzYzbHdyWTZwZkdCSGVXZFEiLCJ5IjoiMnlJaHBMTEFRVUlWWEVXOHR3ZGNrN21LS0tzWkN3QzlzSGFFZW4zWGtqMCJ9LCJ0eXAiOiJkYnNjK2p3dCJ9.eyJqdGkiOiJZMmhoYkd4bGJtZGxDZz09In0.mKqV-VmLWGBBmrYKPSb7AJeyk4iP9kFN8VlfBc-qT9gNaBQDtUhXUwLgGfeIzagPPWEwcTrgcJ7dJEyVqmIi6w";
+        let header = decode_header(jwt).unwrap();
+        dbg!(&header);
+
+        let mut validation = Validation::new(header.alg);
+        // exp is not in the DBSC claims
+        validation.required_spec_claims = HashSet::new();
+        validation.validate_exp = false;
+
+        let claims = match decode::<Claims>(
+            jwt,
+            &DecodingKey::from_jwk(&header.jwk.unwrap()).unwrap(),
+            &validation,
+        ) {
+            Ok(claims) => claims,
+            Err(e) => panic!("{}", e),
+        };
+        dbg!(&claims);
+    }
 }
