@@ -9,10 +9,11 @@ use axum::{
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::{DateTime, TimeDelta, Utc};
+use cookie::time::Duration;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::Jwk};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     env,
     net::SocketAddr,
     path::PathBuf,
@@ -109,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/StartSession", post(dbsc_start_session))
         .with_state(datastore.clone())
         .route("/RefreshSession", post(dbsc_refresh_session))
+        .with_state(datastore.clone())
+        .route("/terminate", post(dbsc_terminate_session))
         .with_state(datastore.clone())
         .layer(DefaultHeadersLayer::new(default_headers))
         .layer(TraceLayer::new_for_http());
@@ -210,10 +213,22 @@ async fn dbsc_refresh_session(
     body: String,
 ) -> impl IntoResponse {
     println!(
-        "refresh_session::Received but terminating session (body={})",
-        body
+        "refresh_session::Received (body={}, headers={:?})",
+        body, &headers
     );
-    dbg!(&headers);
+    // sec-secure-session-id
+    (StatusCode::OK, "")
+}
+
+async fn dbsc_terminate_session(
+    State(ds): State<SharedDatastore>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    println!(
+        "terminating session (body={}, headers={:?})",
+        body, &headers,
+    );
     // sec-secure-session-id
     (StatusCode::OK, "{\"continue\": false}")
 }
@@ -229,7 +244,7 @@ async fn login(State(ds): State<SharedDatastore>, jar: CookieJar) -> impl IntoRe
     let session = Session {
         id,
         refresh_token: String::from("RT1234-5678"),
-        expiry: Utc::now() + TimeDelta::seconds(60),
+        expiry: Utc::now() + TimeDelta::seconds(30),
         jwk: None,
         challenge: Uuid::new_v4().to_string(),
     };
@@ -237,7 +252,8 @@ async fn login(State(ds): State<SharedDatastore>, jar: CookieJar) -> impl IntoRe
         .await
         .data
         .insert(id.to_string(), session.clone());
-    let cookie = Cookie::new("ticket", id.to_string());
+    let mut cookie = Cookie::new("ticket", id.to_string());
+    cookie.set_max_age(Duration::seconds(30));
 
     // direct browser to initiate DBSC if supported
     (
