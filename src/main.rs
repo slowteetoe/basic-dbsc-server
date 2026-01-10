@@ -1,5 +1,5 @@
 use axum::{
-    BoxError, Router,
+    BoxError, Json, Router,
     extract::State,
     handler::HandlerWithoutStateExt,
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
@@ -49,10 +49,42 @@ pub struct Claims {
 
 #[derive(Debug, Clone)]
 pub struct Datastore {
+    /// base session id -> Session
     pub data: BTreeMap<String, Session>,
 }
 
 type SharedDatastore = Arc<RwLock<Datastore>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrationResponse {
+    pub session_identifier: String,
+    pub refresh_url: String,
+    pub scope: Scope,
+    pub credentials: Vec<Credential>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scope {
+    pub origin: String,
+    pub include_site: bool,
+    pub scope_specification: Vec<ScopeSpecification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeSpecification {
+    #[serde(rename = "type")]
+    pub scope_type: String,
+    pub domain: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Credential {
+    #[serde(rename = "type")]
+    pub cred_type: String,
+    pub name: String,
+    pub attributes: String,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -111,8 +143,6 @@ async fn main() -> anyhow::Result<()> {
         .with_state(datastore.clone())
         .route("/RefreshSession", post(dbsc_refresh_session))
         .with_state(datastore.clone())
-        .route("/terminate", post(dbsc_terminate_session))
-        .with_state(datastore.clone())
         .layer(DefaultHeadersLayer::new(default_headers))
         .layer(TraceLayer::new_for_http());
 
@@ -136,16 +166,13 @@ async fn dbsc_start_session(
     State(ds): State<SharedDatastore>,
     headers: HeaderMap,
     jar: CookieJar,
-    body: String,
-) -> impl IntoResponse {
+) -> Response {
     let ticket = jar.get("ticket").expect("missing ticket cookie").value();
     println!("start_session::{}", ticket);
     dbg!(&headers);
     if let Some(jwt) = headers.get("secure-session-response") {
-        // TODO verify the JWT and extract claims
         let jwt = jwt.to_str().unwrap();
         let header = decode_header(jwt).unwrap();
-        dbg!(&header);
 
         let mut validation = Validation::new(header.alg);
         // exp is not in the DBSC claims
@@ -160,9 +187,7 @@ async fn dbsc_start_session(
             Err(e) => panic!("{}", e),
         };
         dbg!(&claims);
-
-        let mut refresh_token = None;
-
+        let parent_session_id = Uuid::new_v4().to_string();
         {
             let mut ds = ds.write().await;
             if let Some(session) = ds.data.get_mut(ticket) {
@@ -171,39 +196,38 @@ async fn dbsc_start_session(
                         "challenge failed: claims={} vs session={}",
                         claims.jti, session.challenge
                     );
-                    return (StatusCode::FORBIDDEN, "challenge failed".to_owned());
+                    return (StatusCode::FORBIDDEN, "challenge failed".to_owned()).into_response();
                 }
                 println!("session found");
                 session.jwk = Some(jwk);
-                refresh_token = Some(session.refresh_token.clone());
+                // insert a new refreshable session
+
+                let mut new_session = session.clone();
+                new_session.id = Uuid::new_v4();
+                ds.data.insert(parent_session_id.clone(), new_session);
             }
         }
 
+        let registration = RegistrationResponse {
+            session_identifier: parent_session_id,
+            refresh_url: "/RefreshSession".to_owned(),
+            scope: Scope {
+                origin: "https://slowteetoe.info".to_owned(),
+                include_site: true,
+                scope_specification: vec![],
+            },
+            credentials: vec![Credential {
+                cred_type: "cookie".to_owned(),
+                name: "ticket".to_owned(),
+                attributes: "Domain=slowteetoe.info; Path=/; Secure; HttpOnly; SameSite=None"
+                    .to_owned(),
+            }],
+        };
+
         // TODO make this a struct so we don't do this nasty escaping
-        (
-            StatusCode::OK,
-            format!(
-                r#"{{
-      "session_identifier": "{}",
-      "refresh_url": "/RefreshSession",
-
-      "scope": {{
-        "origin": "https://slowteetoe.info",
-        "include_site": true,
-        "scope_specification" : []
-      }},
-
-      "credentials": [{{
-        "type": "cookie",
-        "name": "ticket",
-        "attributes": "Domain=slowteetoe.info; Path=/; Secure; HttpOnly; SameSite=None"
-      }}]
-      }}"#,
-                refresh_token.unwrap()
-            ),
-        )
+        (StatusCode::OK, Json(registration)).into_response()
     } else {
-        (StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned())
+        (StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned()).into_response()
     }
 }
 
@@ -211,7 +235,6 @@ async fn dbsc_refresh_session(
     State(ds): State<SharedDatastore>,
     headers: HeaderMap,
     jar: CookieJar,
-    body: String,
 ) -> Response {
     let session_id = headers.get("Sec-Secure-Session-Id");
     if session_id.is_none() {
@@ -259,10 +282,8 @@ async fn dbsc_refresh_session(
                 return (StatusCode::OK, "{\"continue\": false}").into_response();
             }
             let jwk = session.jwk.as_ref().unwrap();
-            let alg: Algorithm = Algorithm::ES256;
-            dbg!(&alg);
 
-            let mut validation = Validation::new(alg);
+            let mut validation = Validation::new(Algorithm::ES256);
             validation.required_spec_claims = HashSet::new();
             validation.validate_exp = false;
 
@@ -305,19 +326,6 @@ async fn dbsc_refresh_session(
     }
 }
 
-async fn dbsc_terminate_session(
-    State(ds): State<SharedDatastore>,
-    headers: HeaderMap,
-    body: String,
-) -> impl IntoResponse {
-    println!(
-        "terminating session (body={}, headers={:?})",
-        body, &headers,
-    );
-    // sec-secure-session-id
-    (StatusCode::OK, "{\"continue\": false}")
-}
-
 #[allow(dead_code)]
 async fn hello(State(ds): State<SharedDatastore>) -> impl IntoResponse {
     dbg!(&ds);
@@ -326,13 +334,16 @@ async fn hello(State(ds): State<SharedDatastore>) -> impl IntoResponse {
 
 async fn login(State(ds): State<SharedDatastore>, jar: CookieJar) -> impl IntoResponse {
     let id = Uuid::new_v4();
+    let challenge = format!("challenge-{}", Uuid::new_v4().to_string());
     let session = Session {
         id,
         refresh_token: String::from("RT1234-5678"),
         expiry: Utc::now() + TimeDelta::seconds(30),
         jwk: None,
-        challenge: Uuid::new_v4().to_string(),
+        challenge: challenge.clone(),
     };
+
+    // insert the session using the regular session id (we'll switch to refreshable in the /StartSession call)
     ds.write()
         .await
         .data
@@ -345,13 +356,10 @@ async fn login(State(ds): State<SharedDatastore>, jar: CookieJar) -> impl IntoRe
         StatusCode::OK,
         [(
             "Secure-Session-Registration",
-            format!(
-                r#"(ES256);path="/StartSession";challenge="{}""#,
-                session.challenge
-            ),
+            format!(r#"(ES256);path="/StartSession";challenge="{challenge}""#,),
         )],
         jar.add(cookie),
-        format!("you logged in! ticket={}", id.to_string()),
+        format!("you logged in! ticket={id}"),
     )
 }
 
