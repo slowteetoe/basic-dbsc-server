@@ -5,7 +5,7 @@ use axum::{
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 
-use crate::{AppConfig, AppState, SharedSessionManager, session_store::Session};
+use crate::{AppState, SharedSessionManager, session_store::Session};
 
 #[axum::debug_handler]
 pub async fn index(State(session_manager): State<SharedSessionManager>) -> impl IntoResponse {

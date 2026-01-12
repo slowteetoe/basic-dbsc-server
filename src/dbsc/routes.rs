@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     AppConfig, AppState, SharedSessionManager,
-    dbsc::api::{Claims, Credential, RegistrationResponse, Scope},
+    dbsc::{Claims, Credential, RegistrationResponse, Scope},
     session_store::Session,
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
