@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     AppConfig, AppState, SharedSessionManager,
-    dbsc::{Claims, Credential, RegistrationResponse, Scope},
+    dbsc::{self, Claims, Credential, RegistrationResponse, Scope},
     session_store::Session,
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
@@ -60,16 +60,21 @@ pub async fn dbsc_start_session(
                 let (new_session, refreshable_session) =
                     session_manager.upgrade_session_to_refreshable(session.clone(), jwk);
 
+                println!(
+                    "created new session: {}\nusing refreshable session as session for dbsc: {}",
+                    &new_session.id, &refreshable_session.id
+                );
+
                 let registration = RegistrationResponse {
                     session_identifier: refreshable_session.id.to_string(),
-                    refresh_url: "/RefreshSession".to_owned(),
+                    refresh_url: format!("{}", &state.dbsc_config.refresh_session_route),
                     scope: Scope {
                         origin: format!("https://{}", state.config.domain),
                         include_site: true,
                         scope_specification: vec![],
                     },
                     credentials: vec![Credential {
-                        cred_type: "cookie".to_owned(),
+                        cred_type: String::from("cookie"),
                         name: state.config.session_cookie_name.to_owned(),
                         attributes: format!(
                             "Domain={}; Path=/; Secure; HttpOnly; SameSite=None",
@@ -82,6 +87,8 @@ pub async fn dbsc_start_session(
                     Cookie::new(state.config.session_cookie_name, new_session.id.to_string());
                 cookie.set_max_age(new_session.expiry_from_now());
 
+                println!("wrote cookie using: {}", &new_session.id.to_string());
+
                 return (StatusCode::OK, Json(registration)).into_response();
             }
         }
@@ -93,11 +100,15 @@ pub async fn dbsc_start_session(
 pub async fn dbsc_refresh_session(
     State(ds): State<SharedSessionManager>,
     State(config): State<AppConfig>,
+    State(dbsc_config): State<dbsc::Config>,
     headers: HeaderMap,
     jar: CookieJar,
+    body: String,
 ) -> Response {
+    // FIXME - reread the spec - Sec-Secure-Session-Id is not present (but the signed JWT is, yet we'd have to lookup by challenge, which seems wrong...)
     let session_id = headers.get("Sec-Secure-Session-Id");
     if session_id.is_none() {
+        dbg!(&headers, &jar, &body);
         println!("invalid refresh request, no session id present. terminating");
         return (StatusCode::OK, "{\"continue\": false}").into_response();
     }
@@ -109,7 +120,7 @@ pub async fn dbsc_refresh_session(
 
     let mut session_manager = ds.write().await;
 
-    if let Some(session) = session_manager.sessions.get_mut(session_id) {
+    if let Some(session) = session_manager.refreshable_sessions.get_mut(session_id) {
         let secure_session_response = headers.get("Secure-Session-Response");
         // there are two valid paths at this point:
 
@@ -123,8 +134,8 @@ pub async fn dbsc_refresh_session(
                 [(
                     "Secure-Session-Registration",
                     format!(
-                        r#"(ES256);path="/StartSession";challenge="{}""#,
-                        new_challenge
+                        r#"(ES256);path="{}";challenge="{}""#,
+                        &dbsc_config.refresh_session_route, new_challenge
                     ),
                 )],
                 "",
@@ -139,22 +150,18 @@ pub async fn dbsc_refresh_session(
                 .expect("ssr should have been a valid string");
 
             // use the session JWK to validate the refresh request challenge
-            if session.jwk.is_none() {
-                println!("should have been a JWK associated with the session. terminating");
-                return (StatusCode::OK, "{\"continue\": false}").into_response();
-            }
-            let jwk = session.jwk.as_ref().unwrap();
-
             let mut validation = Validation::new(Algorithm::ES256);
             validation.required_spec_claims = HashSet::new();
             validation.validate_exp = false;
 
-            let claims =
-                match decode::<Claims>(jwt, &DecodingKey::from_jwk(jwk).unwrap(), &validation) {
-                    Ok(data) => data.claims,
-                    Err(e) => panic!("{}", e),
-                };
-            dbg!(&claims.jti);
+            let claims = match decode::<Claims>(
+                jwt,
+                &DecodingKey::from_jwk(&session.jwk).unwrap(),
+                &validation,
+            ) {
+                Ok(data) => data.claims,
+                Err(e) => panic!("{}", e),
+            };
             if claims.jti != session.challenge {
                 println!(
                     "failed challenge, submitted={}, expected={}. terminating",
@@ -168,7 +175,7 @@ pub async fn dbsc_refresh_session(
                 id,
                 refresh_token: format!("RT-{}", id.clone()),
                 expiry: Utc::now() + TimeDelta::seconds(30),
-                jwk: Some(jwk.clone()),
+                jwk: Some(session.jwk.clone()),
                 challenge: Uuid::new_v4().to_string(),
             };
             ds.write()
@@ -178,7 +185,7 @@ pub async fn dbsc_refresh_session(
             let mut cookie = Cookie::new(config.session_cookie_name, id.to_string());
             cookie.set_max_age(Duration::seconds(30));
 
-            println!("Successful refresh challenge, rotating session to {id}");
+            println!("Successful refresh challenge, rotating short-lived session to {id}");
             // TODO return the session registration JSON here, which allows us to change the session_identifier
             (StatusCode::OK, jar.add(cookie), "").into_response()
         }

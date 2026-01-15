@@ -41,12 +41,19 @@ pub struct AppConfig {
 #[derive(Debug, Clone)]
 pub struct AppState {
     config: AppConfig,
+    dbsc_config: dbsc::Config,
     session_manager: SharedSessionManager,
 }
 
 impl FromRef<AppState> for AppConfig {
     fn from_ref(app_state: &AppState) -> Self {
         app_state.config.clone()
+    }
+}
+
+impl FromRef<AppState> for dbsc::Config {
+    fn from_ref(app_state: &AppState) -> Self {
+        app_state.dbsc_config.clone()
     }
 }
 
@@ -58,6 +65,10 @@ impl FromRef<AppState> for SharedSessionManager {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let dbsc_config = dbsc::Config {
+        start_session_route: String::from("/StartSession"),
+        refresh_session_route: String::from("/RefreshSession"),
+    };
     let app_config = AppConfig {
         session_cookie_name: String::from("ticket"),
         domain: String::from("slowteetoe.info"),
@@ -72,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 format!(
-                    "info,tower_http=info,axum::rejection=trace,{}=debug",
+                    "info,tower_http=debug,axum::rejection=trace,{}=debug",
                     env!("CARGO_CRATE_NAME")
                 )
                 .into()
@@ -106,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state = AppState {
         config: app_config,
+        dbsc_config: dbsc_config.clone(),
         session_manager,
     };
 
@@ -116,9 +128,15 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state.clone())
         .route("/protected", get(protected_path))
         .with_state(app_state.clone())
-        .route("/StartSession", post(dbsc_start_session))
+        .route(
+            &dbsc_config.clone().start_session_route,
+            post(dbsc_start_session),
+        )
         .with_state(app_state.clone())
-        .route("/RefreshSession", post(dbsc_refresh_session))
+        .route(
+            &dbsc_config.clone().refresh_session_route,
+            post(dbsc_refresh_session),
+        )
         .with_state(app_state.clone())
         .layer(DefaultHeadersLayer::new(default_headers))
         .layer(TraceLayer::new_for_http());

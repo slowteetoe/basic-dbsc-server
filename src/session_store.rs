@@ -93,6 +93,10 @@ impl SessionManager {
         self.refreshable_sessions
             .insert(refreshable.id.to_string(), refreshable.clone());
 
+        // insert the new short-lived session
+        self.sessions
+            .insert(session.id.to_string(), session.clone());
+
         // return the short-lived and refreshable sessions
         (session, refreshable)
     }

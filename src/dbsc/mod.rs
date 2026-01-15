@@ -3,6 +3,12 @@ pub mod routes;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Config {
+    pub start_session_route: String,
+    pub refresh_session_route: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Claims {
     pub jti: String,
 }

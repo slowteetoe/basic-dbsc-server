@@ -11,7 +11,7 @@ use crate::{AppState, SharedSessionManager, session_store::Session};
 pub async fn index(State(session_manager): State<SharedSessionManager>) -> impl IntoResponse {
     dbg!(&session_manager);
     Html(format!(
-        "(debug) known sessions: {}<br>refreshable sessions: {}",
+        "(debug) known sessions: {}<br>refreshable sessions: {}<br><a href=\"/login\">Login</a> | <a href=\"/protected\">Protected page</a>",
         &session_manager
             .read()
             .await
@@ -54,7 +54,10 @@ pub async fn login(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
             ),
         )],
         jar.add(cookie),
-        format!("you logged in! ticket={}", &session.id),
+        Html(format!(
+            "you logged in! ticket={}<br><a href='/'>Home</a>",
+            &session.id
+        )),
     )
 }
 
@@ -67,7 +70,9 @@ pub async fn protected_path(State(state): State<AppState>, jar: CookieJar) -> im
             dbg!(session);
             return (
                 StatusCode::OK,
-                "You are logged in as {ticket} and can access this page/data",
+                Html(
+                    "You are logged in as {ticket} and can access this page/data<br><a href=\"/\">Home</a>",
+                ),
             );
         } else {
             println!("protected::unauthorized: no session for {ticket} (from cookie)");
@@ -77,6 +82,6 @@ pub async fn protected_path(State(state): State<AppState>, jar: CookieJar) -> im
     println!("protected::unauthorized: no ticket");
     (
         StatusCode::UNAUTHORIZED,
-        "Please login to access this resource",
+        Html("Please login to access this resource"),
     )
 }
