@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use chrono::{TimeDelta, Utc};
+
 use cookie::time::Duration;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use uuid::Uuid;
@@ -14,7 +14,6 @@ use uuid::Uuid;
 use crate::{
     AppConfig, AppState, SharedSessionManager,
     dbsc::{self, Claims, Credential, RegistrationResponse, Scope},
-    session_store::Session,
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 
@@ -67,7 +66,7 @@ pub async fn dbsc_start_session(
 
                 let registration = RegistrationResponse {
                     session_identifier: refreshable_session.id.to_string(),
-                    refresh_url: format!("{}", &state.dbsc_config.refresh_session_route),
+                    refresh_url: (&state.dbsc_config.refresh_session_route).to_string(),
                     scope: Scope {
                         origin: format!("https://{}", state.config.domain),
                         include_site: true,
@@ -98,15 +97,15 @@ pub async fn dbsc_start_session(
 }
 
 pub async fn dbsc_refresh_session(
-    State(ds): State<SharedSessionManager>,
+    State(session_manager): State<SharedSessionManager>,
     State(config): State<AppConfig>,
-    State(dbsc_config): State<dbsc::Config>,
+    State(_dbsc_config): State<dbsc::Config>,
     headers: HeaderMap,
     jar: CookieJar,
     body: String,
 ) -> Response {
-    // FIXME - reread the spec - Sec-Secure-Session-Id is not present (but the signed JWT is, yet we'd have to lookup by challenge, which seems wrong...)
-    let session_id = headers.get("Sec-Secure-Session-Id");
+    // FIXME - test this, seems like we're missing the Sec-Secure-Session-Id header?
+    let session_id = headers.get("sec-secure-session-id");
     if session_id.is_none() {
         dbg!(&headers, &jar, &body);
         println!("invalid refresh request, no session id present. terminating");
@@ -118,30 +117,46 @@ pub async fn dbsc_refresh_session(
         .to_str()
         .expect("session_id should have been a valid string");
 
-    let mut session_manager = ds.write().await;
-
-    if let Some(session) = session_manager.refreshable_sessions.get_mut(session_id) {
+    if session_manager
+        .read()
+        .await
+        .refreshable_sessions
+        .contains_key(session_id)
+    {
         let secure_session_response = headers.get("Secure-Session-Response");
         // there are two valid paths at this point:
 
         if secure_session_response.is_none() {
-            // 1. browser is attempting to refresh the session, but we haven't challenged them yet - we respond back with a
-            // HTTP 403 and a new Secure-Session-Challenge: "challenge_value";id="session_id"
-            let new_challenge = format!("challenge-{}", Uuid::new_v4());
-            session.challenge = new_challenge.clone();
-            (
-                StatusCode::FORBIDDEN,
-                [(
-                    "Secure-Session-Registration",
-                    format!(
-                        r#"(ES256);path="{}";challenge="{}""#,
-                        &dbsc_config.refresh_session_route, new_challenge
-                    ),
-                )],
-                "",
-            )
-                .into_response()
+            if let Some(session) = session_manager
+                .write()
+                .await
+                .refreshable_sessions
+                .get_mut(session_id)
+            {
+                // 1. browser is attempting to refresh the session, but we haven't challenged them yet - we respond back with a
+                // HTTP 403 and a new Secure-Session-Challenge: "challenge_value";id="session_id"
+                let new_challenge = format!("challenge-{}", Uuid::new_v4());
+                session.challenge = new_challenge.clone();
+                (
+                    StatusCode::FORBIDDEN,
+                    [(
+                        "Secure-Session-Challenge",
+                        format!(r#""{}";id="{}""#, &new_challenge, session_id),
+                    )],
+                    "",
+                )
+                    .into_response()
+            } else {
+                unimplemented!()
+            }
         } else {
+            let session = session_manager
+                .read()
+                .await
+                .refreshable_sessions
+                .get(session_id)
+                .expect("should have retrieved refreshable session")
+                .clone();
             // 2. browser has completed the challenge
             // in which case there will be a 'Secure-Session-Response' header with a JWT proof we need to validate
             let jwt = secure_session_response
@@ -170,23 +185,24 @@ pub async fn dbsc_refresh_session(
                 return (StatusCode::OK, "{\"continue\": false}").into_response();
             }
 
-            let id = Uuid::new_v4();
-            let session = Session {
-                id,
-                refresh_token: format!("RT-{}", id.clone()),
-                expiry: Utc::now() + TimeDelta::seconds(30),
-                jwk: Some(session.jwk.clone()),
-                challenge: Uuid::new_v4().to_string(),
-            };
-            ds.write()
+            let access_token = jar
+                .get(&config.session_cookie_name)
+                .expect("should have had a valid ticket cookie")
+                .value();
+
+            let new_session = session_manager
+                .write()
                 .await
-                .sessions
-                .insert(id.to_string(), session.clone());
-            let mut cookie = Cookie::new(config.session_cookie_name, id.to_string());
+                .refresh_short_lived_session(&session.id.to_string(), access_token);
+
+            let mut cookie = Cookie::new(config.session_cookie_name, new_session.id.to_string());
             cookie.set_max_age(Duration::seconds(30));
 
-            println!("Successful refresh challenge, rotating short-lived session to {id}");
-            // TODO return the session registration JSON here, which allows us to change the session_identifier
+            println!(
+                "Successful refresh challenge, rotating short-lived session to {}",
+                new_session.id
+            );
+            // TODO return the session registration JSON here, which allows us to change the session_identifier if we need
             (StatusCode::OK, jar.add(cookie), "").into_response()
         }
     } else {

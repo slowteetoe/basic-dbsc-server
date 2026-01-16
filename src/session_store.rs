@@ -100,4 +100,27 @@ impl SessionManager {
         // return the short-lived and refreshable sessions
         (session, refreshable)
     }
+
+    pub fn refresh_short_lived_session(
+        &mut self,
+        refresh_token: &str,
+        access_token: &str,
+    ) -> Session {
+        let refreshable = self
+            .refreshable_sessions
+            .get_mut(refresh_token)
+            .expect("should have found refreshable session");
+        // invalidate the existing short-lived session and return a new one
+        let old_session = self
+            .sessions
+            .remove(access_token)
+            .expect("should have found short-lived session");
+        let mut new_session = old_session.clone();
+        new_session.refresh_token = refreshable.id.to_string();
+        new_session.challenge = format!("refreshed-challenge-{}", Uuid::new_v4());
+        self.sessions
+            .insert(new_session.id.to_string(), new_session.clone());
+        println!("invalidated {} and issued {:?}", access_token, new_session);
+        new_session
+    }
 }
