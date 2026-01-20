@@ -5,13 +5,13 @@ use axum::{
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 
-use crate::{AppState, SharedSessionManager, session_store::Session};
+use crate::{AppState, SharedSessionManager};
 
 #[axum::debug_handler]
 pub async fn index(State(session_manager): State<SharedSessionManager>) -> impl IntoResponse {
     dbg!(&session_manager);
     Html(format!(
-        "(debug) known sessions: {}<br>refreshable sessions: {}<br><a href=\"/login\">Login</a> | <a href=\"/protected\">Protected page</a>",
+        "(debug) known sessions: {}<br><a href=\"/login\">Login</a> | <a href=\"/protected\">Protected page</a>",
         &session_manager
             .read()
             .await
@@ -20,28 +20,23 @@ pub async fn index(State(session_manager): State<SharedSessionManager>) -> impl 
             .cloned()
             .collect::<Vec<_>>()
             .join(", "),
-        &session_manager
-            .read()
-            .await
-            .refreshable_sessions
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
     ))
 }
 
 #[axum::debug_handler]
 pub async fn login(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
     // insert the session using the regular session id (we'll switch to refreshable in the /StartSession call)
-    let session: Session = state
+    let (session, access_token) = state
         .session_manager
         .write()
         .await
         .create_short_lived_session();
 
-    let mut cookie = Cookie::new(state.config.session_cookie_name, session.id.to_string());
-    cookie.set_max_age(session.expiry_from_now());
+    let mut cookie = Cookie::new(
+        state.config.session_cookie_name,
+        access_token.id.to_string(),
+    );
+    cookie.set_max_age(access_token.expiry_from_now());
 
     // direct browser to initiate DBSC if supported
     (
@@ -50,13 +45,13 @@ pub async fn login(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
             "Secure-Session-Registration",
             format!(
                 r#"(ES256);path="/StartSession";challenge="{}""#,
-                &session.challenge
+                &session.last_challenge
             ),
         )],
         jar.add(cookie),
         Html(format!(
-            "you logged in! ticket={}<br><a href='/'>Home</a>",
-            &session.id
+            "you logged in! ticket={} (attached to session={})<br><a href='/'>Home</a>",
+            &access_token.id, &session.id
         )),
     )
 }

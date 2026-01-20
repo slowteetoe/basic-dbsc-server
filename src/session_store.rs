@@ -9,48 +9,56 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: Uuid,
-    pub refresh_token: String,
+    pub expiry: DateTime<Utc>,
+    pub last_challenge: String,
+    pub refresh_token: Option<RefreshToken>,
+    // more state that makes this backing session useful...
+}
+
+/// Even though this naming sounds like OAuth, it is not. Do not expect the same constraints / behavior
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshToken {
+    pub id: Uuid,
     pub expiry: DateTime<Utc>,
     pub jwk: Option<Jwk>,
-    // probably need to keep track of this, should be part of the refresh I would think..?
+}
+
+/// Even though this naming sounds like OAuth, it is not. Do not expect the same constraints / behavior
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessToken {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub expiry: DateTime<Utc>,
+    pub jwk: Option<Jwk>,
     pub challenge: String,
 }
 
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Session {
-    pub fn new() -> Self {
+impl AccessToken {
+    pub fn new(session: &Session) -> Self {
         Self {
             id: Uuid::new_v4(),
-            refresh_token: "fake".to_owned(),
-            expiry: Utc::now() + TimeDelta::seconds(30),
+            session_id: session.id,
+            expiry: Utc::now() + TimeDelta::hours(24),
             jwk: None,
-            challenge: "fake".to_owned(),
+            challenge: format!("challenge-{}", Uuid::new_v4()),
         }
     }
 
     pub fn expiry_from_now(&self) -> Duration {
         Duration::seconds((self.expiry - Utc::now()).num_seconds())
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RefreshableSession {
-    pub id: Uuid,
-    pub expiry: DateTime<Utc>,
-    pub jwk: Jwk,
-    pub challenge: String,
+    pub fn is_refreshable(&self) -> bool {
+        self.jwk.is_some() && self.expiry_from_now() >= Duration::seconds(1)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     /// base session id -> Session
-    pub refreshable_sessions: BTreeMap<String, RefreshableSession>,
     pub sessions: BTreeMap<String, Session>,
+    pub access_tokens: BTreeMap<String, AccessToken>,
+    pub refresh_tokens: BTreeMap<String, RefreshToken>,
 }
 
 impl Default for SessionManager {
@@ -62,65 +70,113 @@ impl Default for SessionManager {
 impl SessionManager {
     pub fn new() -> Self {
         Self {
-            refreshable_sessions: BTreeMap::new(),
+            access_tokens: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            refresh_tokens: BTreeMap::new(),
         }
     }
 
-    pub fn create_short_lived_session(&mut self) -> Session {
-        let session = Session::new();
+    pub fn get_session(_access_token: &str) -> Option<Session> {
+        None
+    }
+
+    pub fn create_short_lived_session(&mut self) -> (Session, AccessToken) {
+        let session = Session {
+            id: Uuid::new_v4(),
+            expiry: Utc::now() + TimeDelta::hours(24),
+            last_challenge: format!("initial-{}", Uuid::new_v4()),
+            refresh_token: None,
+        };
         self.sessions
             .insert(session.id.to_string(), session.clone());
-        session
+
+        let access_token = AccessToken::new(&session);
+        self.access_tokens
+            .insert(access_token.id.to_string(), access_token.clone());
+        (session, access_token)
     }
 
     pub fn upgrade_session_to_refreshable(
         &mut self,
-        session: Session,
+        access_token_id: &str,
         jwk: Jwk,
-    ) -> (Session, RefreshableSession) {
-        let refreshable = RefreshableSession {
-            id: Uuid::new_v4(),
-            expiry: Utc::now() + TimeDelta::days(30),
-            jwk,
-            challenge: format!("challenge-{}", Uuid::new_v4()),
-        };
-        // invalidate the short-lived session
-        self.sessions.remove(&session.id.to_string());
-        let session = Session::new();
+    ) -> Result<(AccessToken, RefreshToken), String> {
+        let access_token = self.access_tokens.get(access_token_id);
+        if access_token.is_none() {
+            return Err(String::from("invalid access token, not found."));
+        }
 
-        // insert the new refreshable session
-        self.refreshable_sessions
-            .insert(refreshable.id.to_string(), refreshable.clone());
+        if let Some(session) = self
+            .sessions
+            .get_mut(&access_token.unwrap().session_id.to_string())
+        {
+            session.last_challenge = format!("refresh-challenge-{}", Uuid::new_v4());
+            session.refresh_token = Some(RefreshToken {
+                id: Uuid::new_v4(),
+                expiry: session.expiry,
+                jwk: Some(jwk),
+            });
 
-        // insert the new short-lived session
-        self.sessions
-            .insert(session.id.to_string(), session.clone());
-
-        // return the short-lived and refreshable sessions
-        (session, refreshable)
+            // invalidate the existing short-lived access_token
+            self.access_tokens.remove(access_token_id);
+            // insert the new short-lived session access_token
+            let new_access_token = AccessToken::new(session);
+            self.access_tokens
+                .insert(new_access_token.id.to_string(), new_access_token.clone());
+            // return the new access token
+            tracing::info!(
+                "Upgraded session={} to refreshable and rotated access_token from {} to {}",
+                session.id,
+                access_token_id,
+                new_access_token.id
+            );
+            Ok((new_access_token, session.refresh_token.clone().unwrap()))
+        } else {
+            Err(String::from("session id was invalid"))
+        }
     }
 
-    pub fn refresh_short_lived_session(
-        &mut self,
-        refresh_token: &str,
-        access_token: &str,
-    ) -> Session {
+    pub fn refresh_session(&mut self, session_id: &str) -> AccessToken {
         let refreshable = self
-            .refreshable_sessions
-            .get_mut(refresh_token)
-            .expect("should have found refreshable session");
-        // invalidate the existing short-lived session and return a new one
-        let old_session = self
             .sessions
-            .remove(access_token)
-            .expect("should have found short-lived session");
-        let mut new_session = old_session.clone();
-        new_session.refresh_token = refreshable.id.to_string();
-        new_session.challenge = format!("refreshed-challenge-{}", Uuid::new_v4());
-        self.sessions
-            .insert(new_session.id.to_string(), new_session.clone());
-        println!("invalidated {} and issued {:?}", access_token, new_session);
-        new_session
+            .get_mut(session_id)
+            .expect("should have found refreshable session");
+        refreshable.last_challenge = format!("refreshed-challenge-{}", Uuid::new_v4());
+
+        let new_access_token = AccessToken::new(refreshable);
+
+        // TODO invalidate any existing short-lived session(s)
+        // since we don't seem to get the ticket cookie (expired already?)
+        // let removed = self.sessions.remove(refresh_token);
+
+        self.access_tokens
+            .insert(new_access_token.id.to_string(), new_access_token.clone());
+        println!(
+            "invalidated short-lived access_token (TODO) and issued new short-lived access_token: {:?}",
+            new_access_token
+        );
+        new_access_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jsonwebtoken::jwk::Jwk;
+
+    use crate::session_store::SessionManager;
+
+    #[test]
+    fn exercise_lifecycle() {
+        let mut manager = SessionManager::new();
+        let (session, access_token) = manager.create_short_lived_session();
+
+        let result = manager.upgrade_session_to_refreshable(
+            &access_token.id.to_string(),
+            Jwk {
+                common: todo!(),
+                algorithm: todo!(),
+            },
+        );
+        assert!(result.is_ok());
     }
 }
