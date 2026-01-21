@@ -5,7 +5,7 @@ use axum::{
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 
-use crate::{AppState, SharedSessionManager};
+use crate::{AppConfig, AppState, SharedSessionManager};
 
 #[axum::debug_handler]
 pub async fn index(State(session_manager): State<SharedSessionManager>) -> impl IntoResponse {
@@ -15,6 +15,7 @@ pub async fn index(State(session_manager): State<SharedSessionManager>) -> impl 
         &session_manager
             .read()
             .await
+            .clone()
             .sessions
             .keys()
             .cloned()
@@ -44,8 +45,8 @@ pub async fn login(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
         [(
             "Secure-Session-Registration",
             format!(
-                r#"(ES256);path="/StartSession";challenge="{}""#,
-                &session.last_challenge
+                r#"(ES256);path="{}";challenge="{}""#,
+                &state.dbsc_config.start_session_route, &session.last_challenge
             ),
         )],
         jar.add(cookie),
@@ -56,12 +57,15 @@ pub async fn login(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
     )
 }
 
-#[axum::debug_handler]
-pub async fn protected_path(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
-    if let Some(ticket) = jar.get(&state.config.session_cookie_name) {
+#[axum::debug_handler(state=AppState)]
+pub async fn protected_path(
+    State(session_manager): State<SharedSessionManager>,
+    State(app_config): State<AppConfig>,
+    jar: CookieJar,
+) -> impl IntoResponse {
+    if let Some(ticket) = jar.get(&app_config.session_cookie_name) {
         let ticket = ticket.value();
-        let ds = state.session_manager.read().await;
-        if let Some(session) = ds.sessions.get(ticket) {
+        if let Some(session) = session_manager.read().await.sessions.get(ticket) {
             dbg!(session);
             return (
                 StatusCode::OK,
@@ -70,13 +74,13 @@ pub async fn protected_path(State(state): State<AppState>, jar: CookieJar) -> im
                 ),
             );
         } else {
-            println!("protected::unauthorized: no session for {ticket} (from cookie)");
+            tracing::info!("protected::unauthorized: no session for {ticket} (from cookie)");
         }
     }
 
-    println!("protected::unauthorized: no ticket");
+    tracing::info!("protected::unauthorized: no ticket");
     (
         StatusCode::UNAUTHORIZED,
-        Html("Please login to access this resource"),
+        Html("Please login to access this resource."),
     )
 }
