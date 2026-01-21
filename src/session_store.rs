@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use cookie::time::Duration;
-use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::{DecodingKey, jwk::Jwk};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -21,6 +21,15 @@ pub struct RefreshToken {
     pub id: Uuid,
     pub expiry: DateTime<Utc>,
     pub jwk: Option<Jwk>,
+}
+
+impl RefreshToken {
+    pub fn decoding_key(&self) -> Result<Option<DecodingKey>, anyhow::Error> {
+        match &self.jwk {
+            Some(key) => Ok(Some(DecodingKey::from_jwk(key)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Even though this naming sounds like OAuth, it is not. Do not expect the same constraints / behavior
@@ -101,48 +110,50 @@ impl SessionManager {
         access_token_id: &str,
         jwk: Jwk,
     ) -> Result<(AccessToken, RefreshToken), String> {
-        let access_token = self.access_tokens.get(access_token_id);
-        if access_token.is_none() {
-            return Err(String::from("invalid access token, not found."));
-        }
+        if let Some(access_token) = self.access_tokens.get(access_token_id) {
+            if let Some(session) = self.sessions.get_mut(&access_token.session_id.to_string()) {
+                let refresh_token = RefreshToken {
+                    id: Uuid::new_v4(),
+                    expiry: session.expiry,
+                    jwk: Some(jwk),
+                };
+                session.last_challenge = format!("refresh-challenge-{}", Uuid::new_v4());
+                session.refresh_token = Some(refresh_token.clone());
 
-        if let Some(session) = self
-            .sessions
-            .get_mut(&access_token.unwrap().session_id.to_string())
-        {
-            session.last_challenge = format!("refresh-challenge-{}", Uuid::new_v4());
-            session.refresh_token = Some(RefreshToken {
-                id: Uuid::new_v4(),
-                expiry: session.expiry,
-                jwk: Some(jwk),
-            });
-
-            // invalidate the existing short-lived access_token
-            self.access_tokens.remove(access_token_id);
-            // insert the new short-lived session access_token
-            let new_access_token = AccessToken::new(session);
-            self.access_tokens
-                .insert(new_access_token.id.to_string(), new_access_token.clone());
-            // return the new access token
-            tracing::info!(
-                "Upgraded session={} to refreshable and rotated access_token from {} to {}",
-                session.id,
-                access_token_id,
-                new_access_token.id
-            );
-            Ok((new_access_token, session.refresh_token.clone().unwrap()))
+                // invalidate the existing short-lived access_token
+                self.access_tokens.remove(access_token_id);
+                // insert the new short-lived session access_token
+                let new_access_token = AccessToken::new(session);
+                self.access_tokens
+                    .insert(new_access_token.id.to_string(), new_access_token.clone());
+                // return the new access token
+                tracing::info!(
+                    "Upgraded session={} to refreshable and rotated access_token from {} to {}",
+                    session.id,
+                    access_token_id,
+                    new_access_token.id
+                );
+                Ok((new_access_token, refresh_token))
+            } else {
+                Err(String::from("session id was invalid"))
+            }
         } else {
-            Err(String::from("session id was invalid"))
+            Err(String::from("invalid access token, not found."))
         }
     }
 
-    pub fn refresh_session(&mut self, session_id: &str) -> AccessToken {
-        let refreshable = self
-            .sessions
-            .get_mut(session_id)
-            .expect("should have found refreshable session");
-        refreshable.last_challenge = format!("refreshed-challenge-{}", Uuid::new_v4());
+    pub fn refresh_session(&mut self, session_id: &str) -> Result<AccessToken, anyhow::Error> {
+        let refreshable = match self.sessions.get_mut(session_id) {
+            Some(rt) => rt,
+            None => {
+                return Err(anyhow::anyhow!(format!(
+                    "session not found: {}",
+                    session_id
+                )));
+            }
+        };
 
+        refreshable.last_challenge = format!("refreshed-challenge-{}", Uuid::new_v4());
         let new_access_token = AccessToken::new(refreshable);
 
         // TODO invalidate any existing short-lived session(s)
@@ -151,11 +162,12 @@ impl SessionManager {
 
         self.access_tokens
             .insert(new_access_token.id.to_string(), new_access_token.clone());
-        println!(
+
+        tracing::info!(
             "invalidated short-lived access_token (TODO) and issued new short-lived access_token: {:?}",
             new_access_token
         );
-        new_access_token
+        Ok(new_access_token)
     }
 }
 

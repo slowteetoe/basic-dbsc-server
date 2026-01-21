@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     BoxError, Router,
     extract::FromRef,
@@ -92,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let origin_trial = env::var("ORIGIN_TRIAL").expect("missing ORIGIN_TRIAL env var");
+    let origin_trial = env::var("ORIGIN_TRIAL").context("missing ORIGIN_TRIAL env variable")?;
 
     let mut default_headers = HeaderMap::new();
     default_headers.insert(
@@ -110,8 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // configure certificate and private key used by https
     let config =
         RustlsConfig::from_pem_file(&app_config.tls_certificate, &app_config.tls_private_key)
-            .await
-            .unwrap();
+            .await?;
 
     let session_manager: SharedSessionManager = Arc::new(RwLock::new(SessionManager::new()));
 
@@ -146,12 +146,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!("listening on {}", addr);
     axum_server::bind_rustls(addr, config)
         .serve(app.into_make_service())
-        .await
-        .unwrap();
+        .await?;
     Ok(())
 }
 
-#[allow(dead_code, unused_results, unused_must_use)]
+#[allow(dead_code, unused_results, unused_must_use, clippy::unwrap_used)]
 async fn redirect_http_to_https(ports: Ports) {
     fn make_https(uri: Uri, https_port: u16) -> Result<Uri, BoxError> {
         let mut parts = uri.into_parts();
@@ -160,7 +159,7 @@ async fn redirect_http_to_https(ports: Ports) {
         parts.authority = Some(format!("localhost:{https_port}").parse()?);
 
         if parts.path_and_query.is_none() {
-            parts.path_and_query = Some("/".parse().unwrap());
+            parts.path_and_query = Some("/".parse()?);
         }
 
         Ok(Uri::from_parts(parts)?)

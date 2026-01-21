@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, panic};
 
 use axum::{
     Json,
@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use anyhow::{Context, Result};
 use cookie::time::Duration;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use uuid::Uuid;
@@ -17,32 +18,55 @@ use crate::{
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 
+pub struct DbscError(anyhow::Error);
+
+// tell axum how to convert our error into a response
+impl IntoResponse for DbscError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Something went wrong: {}", self.0),
+        )
+            .into_response()
+    }
+}
+
+impl<E> From<E> for DbscError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
+}
+
 #[axum::debug_handler]
 pub async fn dbsc_start_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     jar: CookieJar,
-) -> Response {
+) -> Result<Response, DbscError> {
     dbg!(&headers, &jar);
     if let Some(ticket) = jar.get(&state.config.session_cookie_name) {
         let ticket = ticket.value();
         tracing::info!("start_session -> existing ticket={}", ticket);
         if let Some(jwt) = headers.get("secure-session-response") {
-            let jwt = jwt.to_str().unwrap();
-            let header = decode_header(jwt).unwrap();
+            let jwt = jwt.to_str()?;
+            let jwt_header = decode_header(jwt)?;
 
-            let mut validation = Validation::new(header.alg);
+            let mut validation = Validation::new(jwt_header.alg);
             // exp is not in the DBSC claims
             validation.required_spec_claims = HashSet::new();
             validation.validate_exp = false;
 
-            let jwk = header.jwk.unwrap();
+            let jwk = match jwt_header.jwk {
+                Some(jwk) => jwk,
+                None => panic!("failed to read jwk from secure session response"),
+            };
 
-            let claims =
-                match decode::<Claims>(jwt, &DecodingKey::from_jwk(&jwk).unwrap(), &validation) {
-                    Ok(data) => data.claims,
-                    Err(e) => panic!("{}", e),
-                };
+            let decoding_key = DecodingKey::from_jwk(&jwk)?;
+
+            let claims = decode::<Claims>(jwt, &decoding_key, &validation)?.claims;
 
             let mut session_manager = state.session_manager.write().await;
 
@@ -54,50 +78,51 @@ pub async fn dbsc_start_session(
                         claims.jti,
                         session.last_challenge
                     );
-                    return (StatusCode::FORBIDDEN, "challenge failed".to_owned()).into_response();
+                    return Ok(
+                        (StatusCode::FORBIDDEN, "challenge failed".to_owned()).into_response()
+                    );
                 }
                 tracing::info!("session found, upgrading...");
-                let result = session_manager.upgrade_session_to_refreshable(ticket, jwk);
-                if result.is_err() {
-                    tracing::error!("failed to upgrade session: {:?}", result.err());
-                    return (StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned())
-                        .into_response();
+                if let Ok((access_token, _refresh_token)) =
+                    session_manager.upgrade_session_to_refreshable(ticket, jwk)
+                {
+                    let registration = RegistrationResponse {
+                        session_identifier: session.id.to_string(),
+                        refresh_url: state.dbsc_config.refresh_session_route.to_string(),
+                        scope: Scope {
+                            origin: format!("https://{}", state.config.domain),
+                            include_site: true,
+                            scope_specification: vec![],
+                        },
+                        credentials: vec![Credential {
+                            cred_type: String::from("cookie"),
+                            name: state.config.session_cookie_name.to_owned(),
+                            attributes: format!(
+                                "Domain={}; Path=/; Secure; HttpOnly; SameSite=None",
+                                state.config.domain
+                            ),
+                        }],
+                    };
+                    tracing::debug!("writing registration response: {:?}", registration);
+                    // write out the new session cookie, it will be short-lived
+                    let mut cookie = Cookie::new(
+                        state.config.session_cookie_name,
+                        access_token.id.to_string(),
+                    );
+                    cookie.set_max_age(Duration::seconds(60));
+
+                    tracing::info!("wrote cookie using: {}", &access_token.id.to_string());
+                    return Ok((StatusCode::OK, Json(registration)).into_response());
+                } else {
+                    tracing::error!("failed to upgrade session");
+                    return Ok((StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned())
+                        .into_response());
                 }
-
-                let (access_token, _refresh_token) = result.unwrap();
-
-                let registration = RegistrationResponse {
-                    session_identifier: session.id.to_string(),
-                    refresh_url: state.dbsc_config.refresh_session_route.to_string(),
-                    scope: Scope {
-                        origin: format!("https://{}", state.config.domain),
-                        include_site: true,
-                        scope_specification: vec![],
-                    },
-                    credentials: vec![Credential {
-                        cred_type: String::from("cookie"),
-                        name: state.config.session_cookie_name.to_owned(),
-                        attributes: format!(
-                            "Domain={}; Path=/; Secure; HttpOnly; SameSite=None",
-                            state.config.domain
-                        ),
-                    }],
-                };
-                tracing::debug!("writing registration response: {:?}", registration);
-                // write out the new session cookie, it will be short-lived
-                let mut cookie = Cookie::new(
-                    state.config.session_cookie_name,
-                    access_token.id.to_string(),
-                );
-                cookie.set_max_age(Duration::seconds(60));
-
-                tracing::info!("wrote cookie using: {}", &access_token.id.to_string());
-                return (StatusCode::OK, Json(registration)).into_response();
             }
         }
     }
     tracing::error!("FAIL::start_session -> fell through...");
-    (StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned()).into_response()
+    Ok((StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned()).into_response())
 }
 
 pub async fn dbsc_refresh_session(
@@ -107,108 +132,110 @@ pub async fn dbsc_refresh_session(
     headers: HeaderMap,
     jar: CookieJar,
     body: String,
-) -> Response {
+) -> Result<Response, DbscError> {
     // FIXME - test this, seems like we're missing the Sec-Secure-Session-Id header?
-    let session_id = headers.get("sec-secure-session-id");
-    if session_id.is_none() {
-        dbg!(&headers, &jar, &body);
-        tracing::error!("invalid refresh request, no session id present. terminating");
-        return (StatusCode::OK, "{\"continue\": false}").into_response();
-    }
+    if let Some(session_id_header) = headers.get("sec-secure-session-id") {
+        let session_id = session_id_header.to_str()?;
 
-    let session_id = session_id
-        .unwrap()
-        .to_str()
-        .expect("session_id should have been a valid string");
+        if !session_manager
+            .read()
+            .await
+            .sessions
+            .contains_key(session_id)
+        {
+            tracing::error!("unknown session id={session_id}, cannot refresh. terminating");
+            return Ok((StatusCode::OK, "{\"continue\": false}").into_response());
+        }
 
-    if session_manager
-        .read()
-        .await
-        .sessions
-        .contains_key(session_id)
-    {
-        let secure_session_response = headers.get("Secure-Session-Response");
+        match headers.get("secure-session-response") {
+            Some(secure_session_response) => {
+                // 1. browser has completed the challenge
+                // in which case there will be a 'Secure-Session-Response' header with a JWT proof we need to validate
+                if let Some(session) = session_manager.read().await.sessions.get(session_id) {
+                    let jwt = secure_session_response.to_str()?;
 
-        // there are two valid paths at this point:
-        if secure_session_response.is_none() {
-            if let Some(session) = session_manager.write().await.sessions.get_mut(session_id) {
-                // 1. browser is attempting to refresh the session, but we haven't challenged them yet - we respond back with a
-                // HTTP 403 and a new Secure-Session-Challenge: "challenge_value";id="session_id"
-                session.last_challenge = format!("refresh-challenge-{}", Uuid::new_v4());
+                    // use the session JWK to validate the refresh request challenge
+                    let mut validation = Validation::new(Algorithm::ES256);
+                    validation.required_spec_claims = HashSet::new();
+                    validation.validate_exp = false;
 
-                let challenge_header_value =
-                    format!(r#""{}";id="{}""#, &session.last_challenge, session_id);
+                    if let Some(refresh_token) = &session.refresh_token {
+                        if let Some(decoding_key) = &refresh_token.decoding_key()? {
+                            let claims = decode::<Claims>(jwt, decoding_key, &validation)
+                                .context("reading claims")?
+                                .claims;
 
-                tracing::info!("Issuing challenge -> {}", &challenge_header_value);
-                (
-                    StatusCode::FORBIDDEN,
-                    [("Secure-Session-Challenge", challenge_header_value)],
-                    "",
-                )
-                    .into_response()
-            } else {
-                unimplemented!()
+                            if claims.jti != session.last_challenge {
+                                tracing::error!(
+                                    "failed challenge, submitted={}, expected={}. terminating",
+                                    claims.jti,
+                                    session.last_challenge
+                                );
+                                return Ok(
+                                    (StatusCode::OK, "{\"continue\": false}").into_response()
+                                );
+                            }
+                        } else {
+                            tracing::error!("no decoding key from refresh token, terminating");
+                            return Ok((StatusCode::OK, "{\"continue\": false}").into_response());
+                        }
+                    } else {
+                        tracing::error!("no refresh token on session");
+                        return Ok((StatusCode::OK, "{\"continue\": false}").into_response());
+                    }
+
+                    let access_token = jar.get(&config.session_cookie_name);
+
+                    tracing::debug!("Existing access token from cookie = {:?}", access_token);
+
+                    let new_access_token = session_manager
+                        .write()
+                        .await
+                        .refresh_session(&session.id.to_string())?;
+
+                    let mut cookie =
+                        Cookie::new(config.session_cookie_name, new_access_token.id.to_string());
+                    cookie.set_max_age(Duration::seconds(30));
+
+                    tracing::info!(
+                        "Successful refresh challenge, rotating short-lived session to {}",
+                        new_access_token.id
+                    );
+                    // TODO return the session registration JSON here, which allows us to change the session_identifier (if we need to)
+                    Ok((StatusCode::OK, jar.add(cookie), "").into_response())
+                } else {
+                    tracing::error!(
+                        "invalid refresh request, no session found for {}",
+                        session_id
+                    );
+                    Ok((StatusCode::OK, "{\"continue\": false}").into_response())
+                }
             }
-        } else {
-            let session = session_manager
-                .read()
-                .await
-                .sessions
-                .get(session_id)
-                .expect("should have retrieved refreshable session")
-                .clone();
-            // 2. browser has completed the challenge
-            // in which case there will be a 'Secure-Session-Response' header with a JWT proof we need to validate
-            let jwt = secure_session_response
-                .unwrap()
-                .to_str()
-                .expect("ssr should have been a valid string");
+            None => {
+                // 2. browser is attempting to refresh the session, but we haven't challenged them yet
+                // we respond back with a HTTP 403 and a new Secure-Session-Challenge: "challenge_value";id="session_id"
+                if let Some(session) = session_manager.write().await.sessions.get_mut(session_id) {
+                    session.last_challenge = format!("refresh-challenge-{}", Uuid::new_v4());
 
-            // use the session JWK to validate the refresh request challenge
-            let mut validation = Validation::new(Algorithm::ES256);
-            validation.required_spec_claims = HashSet::new();
-            validation.validate_exp = false;
+                    let challenge_header_value =
+                        format!(r#""{}";id="{}""#, &session.last_challenge, session_id);
 
-            let claims = match decode::<Claims>(
-                jwt,
-                &DecodingKey::from_jwk(&session.refresh_token.unwrap().jwk.unwrap()).unwrap(),
-                &validation,
-            ) {
-                Ok(data) => data.claims,
-                Err(e) => panic!("{}", e),
-            };
-            if claims.jti != session.last_challenge {
-                tracing::error!(
-                    "failed challenge, submitted={}, expected={}. terminating",
-                    claims.jti,
-                    session.last_challenge
-                );
-                return (StatusCode::OK, "{\"continue\": false}").into_response();
+                    tracing::info!("Issuing challenge -> {}", &challenge_header_value);
+                    Ok((
+                        StatusCode::FORBIDDEN,
+                        [("Secure-Session-Challenge", challenge_header_value)],
+                        "",
+                    )
+                        .into_response())
+                } else {
+                    unimplemented!()
+                }
             }
-
-            let access_token = jar.get(&config.session_cookie_name);
-
-            tracing::debug!("Existing access token from cookie = {:?}", access_token);
-
-            let new_access_token = session_manager
-                .write()
-                .await
-                .refresh_session(&session.id.to_string());
-
-            let mut cookie =
-                Cookie::new(config.session_cookie_name, new_access_token.id.to_string());
-            cookie.set_max_age(Duration::seconds(30));
-
-            tracing::info!(
-                "Successful refresh challenge, rotating short-lived session to {}",
-                new_access_token.id
-            );
-            // TODO return the session registration JSON here, which allows us to change the session_identifier if we need
-            (StatusCode::OK, jar.add(cookie), "").into_response()
         }
     } else {
-        tracing::error!("unknown session id={session_id}, cannot refresh. terminating");
-        (StatusCode::OK, "{\"continue\": false}").into_response()
+        dbg!(&headers, &jar, &body);
+        tracing::error!("invalid refresh request, no session id present. terminating");
+        Ok((StatusCode::OK, "{\"continue\": false}").into_response())
     }
 }
 
