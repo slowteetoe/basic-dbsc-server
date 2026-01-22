@@ -9,6 +9,7 @@ axum = { version = "0.8.8", features = ["http2", "macros"] }
 axum-extra = { version = "0.12.5", features = ["cookie"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 chrono = { version = "0.4", features = ["serde"] }
+console-subscriber = "0.5.0"
 cookie = "0.18.1"
 jsonwebkey = { version = "0.4.0", features = ["jsonwebtoken"] }
 jsonwebtoken = { version = "10" }

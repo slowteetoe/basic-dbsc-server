@@ -39,14 +39,17 @@ where
     }
 }
 
-#[axum::debug_handler]
+#[axum::debug_handler(state=AppState)]
 pub async fn dbsc_start_session(
-    State(state): State<AppState>,
+    State(config): State<AppConfig>,
+    State(dbsc_config): State<dbsc::Config>,
+    State(session_manager): State<SharedSessionManager>,
     headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<Response, DbscError> {
     dbg!(&headers, &jar);
-    if let Some(ticket) = jar.get(&state.config.session_cookie_name) {
+    let mut session_manager = session_manager.lock().await;
+    if let Some(ticket) = jar.get(&config.session_cookie_name) {
         let ticket = ticket.value();
         tracing::debug!("start_session -> existing ticket={}", ticket);
         if let Some(jwt) = headers.get("secure-session-response") {
@@ -73,75 +76,67 @@ pub async fn dbsc_start_session(
 
             let claims = decode::<Claims>(jwt, &decoding_key, &validation)?.claims;
 
-            let mut session_manager = state.session_manager.write().await;
-
-            if let Some(access_token) = session_manager.clone().access_tokens.get_mut(ticket) {
-                if let Some(session) = session_manager
-                    .clone()
-                    .sessions
-                    .get(&access_token.session_id.to_string())
+            if let Some(session) = session_manager.get_session(ticket).await {
+                // we had a session, check the challenge
+                if claims.jti != session.last_challenge {
+                    tracing::error!(
+                        "start_session -> challenge failed: claims={} vs session={}",
+                        claims.jti,
+                        session.last_challenge
+                    );
+                    return Ok(
+                        (StatusCode::FORBIDDEN, "challenge failed".to_owned()).into_response()
+                    );
+                }
+                tracing::info!("start_session -> session found, upgrading...");
+                if let Ok((access_token, _refresh_token)) = session_manager
+                    .upgrade_session_to_refreshable(ticket, jwk)
+                    .await
                 {
-                    // we had a session, check the challenge
-                    if claims.jti != session.last_challenge {
-                        tracing::error!(
-                            "start_session -> challenge failed: claims={} vs session={}",
-                            claims.jti,
-                            session.last_challenge
-                        );
-                        return Ok(
-                            (StatusCode::FORBIDDEN, "challenge failed".to_owned()).into_response()
-                        );
-                    }
-                    tracing::info!("start_session -> session found, upgrading...");
-                    if let Ok((access_token, _refresh_token)) =
-                        session_manager.upgrade_session_to_refreshable(ticket, jwk)
-                    {
-                        let registration = RegistrationResponse {
-                            session_identifier: session.id.to_string(),
-                            refresh_url: state.dbsc_config.refresh_session_route.to_string(),
-                            scope: Scope {
-                                origin: format!("https://{}", state.config.domain),
-                                include_site: true,
-                                scope_specification: vec![],
-                            },
-                            credentials: vec![Credential {
-                                cred_type: String::from("cookie"),
-                                name: state.config.session_cookie_name.to_owned(),
-                                attributes: format!(
-                                    "Domain={}; Path=/; Secure; HttpOnly; SameSite=None",
-                                    state.config.domain
-                                ),
-                            }],
-                        };
-                        tracing::debug!("writing registration response: {:?}", registration);
-                        // write out the new session cookie, it will be short-lived
-                        let mut cookie = Cookie::new(
-                            state.config.session_cookie_name,
-                            access_token.id.to_string(),
-                        );
-                        cookie.set_max_age(Duration::seconds(60));
+                    let registration = RegistrationResponse {
+                        session_identifier: session.id.to_string(),
+                        refresh_url: dbsc_config.refresh_session_route.to_string(),
+                        scope: Scope {
+                            origin: format!("https://{}", config.domain),
+                            include_site: true,
+                            scope_specification: vec![],
+                        },
+                        credentials: vec![Credential {
+                            cred_type: String::from("cookie"),
+                            name: config.session_cookie_name.to_owned(),
+                            attributes: format!(
+                                "Domain={}; Path=/; Secure; HttpOnly; SameSite=None",
+                                config.domain
+                            ),
+                        }],
+                    };
+                    tracing::debug!("writing registration response: {:?}", registration);
+                    // write out the new session cookie, it will be short-lived
+                    let mut cookie =
+                        Cookie::new(config.session_cookie_name, access_token.id.to_string());
+                    cookie.set_max_age(Duration::seconds(60));
 
-                        tracing::info!("wrote cookie using: {}", &access_token.id.to_string());
-                        return Ok((StatusCode::OK, Json(registration)).into_response());
-                    } else {
-                        tracing::error!("session not found, used {}", access_token.id);
-                        return Ok((StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned())
-                            .into_response());
-                    }
+                    tracing::info!("wrote cookie using: {}", &access_token.id.to_string());
+                    return Ok((StatusCode::OK, Json(registration)).into_response());
                 } else {
-                    tracing::error!("failed to upgrade session");
+                    tracing::error!("session not found, used {}", ticket);
                     return Ok((StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned())
                         .into_response());
                 }
             } else {
-                tracing::error!("No session found.");
+                tracing::error!("failed to upgrade session");
+                return Ok(
+                    (StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned()).into_response()
+                );
             }
         } else {
-            tracing::error!("No jwt present");
+            tracing::error!("No jwt present.");
         }
     } else {
-        tracing::error!("No ticket cookie");
+        // Is this really a problem? Shouldn't we just use the session ID?
+        tracing::error!("No ticket cookie present");
     }
+
     tracing::error!("FAIL::start_session -> fell through...");
     Ok((StatusCode::BAD_REQUEST, "Invalid DBSC request".to_owned()).into_response())
 }
@@ -154,16 +149,12 @@ pub async fn dbsc_refresh_session(
     jar: CookieJar,
     body: String,
 ) -> Result<Response, DbscError> {
+    let mut session_manager = session_manager.lock().await;
     if let Some(session_id_header) = headers.get("sec-secure-session-id") {
         let session_id = session_id_header.to_str()?;
+        tracing::debug!("session id from header: {}", session_id);
 
-        if !session_manager
-            .read()
-            .await
-            .clone()
-            .sessions
-            .contains_key(session_id)
-        {
+        if !session_manager.session_exists(session_id).await {
             tracing::error!("unknown session id={session_id}, cannot refresh. terminating");
             return Ok((StatusCode::OK, "{\"continue\": false}").into_response());
         }
@@ -172,13 +163,7 @@ pub async fn dbsc_refresh_session(
             Some(secure_session_response) => {
                 // 1. browser has completed the challenge
                 // in which case there will be a 'Secure-Session-Response' header with a JWT proof we need to validate
-                if let Some(session) = session_manager
-                    .read()
-                    .await
-                    .clone()
-                    .sessions
-                    .get(session_id)
-                {
+                if let Some(session) = session_manager.get_session_by_id(session_id).await {
                     let jwt = secure_session_response.to_str()?;
 
                     // use the session JWK to validate the refresh request challenge
@@ -216,9 +201,8 @@ pub async fn dbsc_refresh_session(
                     tracing::debug!("Existing access token from cookie = {:?}", access_token);
 
                     let new_access_token = session_manager
-                        .write()
-                        .await
                         .refresh_session(&session.id.to_string())
+                        .await
                         .with_context(|| "failed during refresh session")?;
 
                     let mut cookie =
@@ -242,13 +226,7 @@ pub async fn dbsc_refresh_session(
             None => {
                 // 2. browser is attempting to refresh the session, but we haven't challenged them yet
                 // we respond back with a HTTP 403 and a new Secure-Session-Challenge: "challenge_value";id="session_id"
-                if let Some(session) = session_manager
-                    .read()
-                    .await
-                    .clone()
-                    .sessions
-                    .get_mut(session_id)
-                {
+                if let Some(session) = session_manager.get_session_by_id(session_id).await {
                     let challenge_header_value =
                         format!(r#""{}";id="{}""#, &session.last_challenge, session_id);
 

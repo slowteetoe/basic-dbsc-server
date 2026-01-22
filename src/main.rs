@@ -9,9 +9,9 @@ use axum::{
 };
 
 use axum_server::tls_rustls::RustlsConfig;
+use tokio::sync::Mutex;
 
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::sync::RwLock;
 use tower_default_headers::DefaultHeadersLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -29,7 +29,7 @@ struct Ports {
     https: u16,
 }
 
-pub type SharedSessionManager = Arc<RwLock<SessionManager>>;
+pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -80,11 +80,12 @@ async fn main() -> anyhow::Result<()> {
             .join("self_signed_certs")
             .join("slowteetoe.info+1-key.pem"),
     };
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 format!(
-                    "info,tower_http=debug,axum::rejection=trace,{}=debug",
+                    "info,tokio=trace,runtime=trace,tower_http=debug,axum::rejection=trace,{}=debug",
                     env!("CARGO_CRATE_NAME")
                 )
                 .into()
@@ -113,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         RustlsConfig::from_pem_file(&app_config.tls_certificate, &app_config.tls_private_key)
             .await?;
 
-    let session_manager: SharedSessionManager = Arc::new(RwLock::new(SessionManager::new()));
+    let session_manager: SharedSessionManager = Arc::new(Mutex::new(SessionManager::new()));
 
     let app_state = AppState {
         config: app_config,
